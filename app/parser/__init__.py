@@ -1,32 +1,8 @@
-from app.parser.command_parser import parse_command, ParsedCommand, CommandName, ParseError
-from app.parser.instructions import (
-    parse_instruction,
-    AnyInstruction,
-    ActionType,
-    InstructionError,
-    BuyInstruction,
-    SellInstruction,
-    SetWeightInstruction,
-    RebalanceInstruction,
-    ShowPortfolioInstruction,
-    ShowHistoryInstruction,
-    AddThesisInstruction,
-)
+from app.parser.command_parser import CommandName, ParsedCommand, ParseError, parse_command
 
 __all__ = [
     "parse_command",
     "ParsedCommand",
     "CommandName",
     "ParseError",
-    "parse_instruction",
-    "AnyInstruction",
-    "ActionType",
-    "InstructionError",
-    "BuyInstruction",
-    "SellInstruction",
-    "SetWeightInstruction",
-    "RebalanceInstruction",
-    "ShowPortfolioInstruction",
-    "ShowHistoryInstruction",
-    "AddThesisInstruction",
 ]

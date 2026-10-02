@@ -103,6 +103,21 @@ def test_buy_negative_size():
         parse_command("/buy AAPL -5")
 
 
+def test_buy_zero_size():
+    with pytest.raises(ParseError, match="> 0"):
+        parse_command("/buy AAPL 0")
+
+
+def test_sell_zero_size():
+    with pytest.raises(ParseError, match="> 0"):
+        parse_command("/sell AAPL 0")
+
+
+def test_buy_zero_limit_price():
+    with pytest.raises(ParseError, match="> 0"):
+        parse_command("/buy AAPL 10 0")
+
+
 def test_confirm_non_integer():
     with pytest.raises(ParseError, match="integer"):
         parse_command("/confirm abc")
@@ -116,3 +131,17 @@ def test_status_with_args():
 def test_thesis_flag_without_value():
     with pytest.raises(ParseError, match="--thesis flag requires"):
         parse_command("/buy AAPL 10 --thesis")
+
+
+def test_package_reexports_only_the_live_parser():
+    """``app.parser`` exposes the regex parser and nothing else.
+
+    Pins the deletion of the unused Pydantic instruction layer: it was
+    imported on every bot startup purely through this re-export.
+    """
+    import app.parser as pkg
+
+    assert pkg.parse_command is parse_command
+    assert pkg.ParseError is ParseError
+    assert not hasattr(pkg, "parse_instruction")
+    assert not hasattr(pkg, "BuyInstruction")
