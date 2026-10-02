@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.db.ledger import get_cash_balance
 from app.db.models import Holding, Order, OrderSide, OrderStatus
+from app.portfolio.pricing import resolve_price
 
 
 @dataclass
@@ -70,7 +71,10 @@ class RiskChecker:
             ticker: Instrument symbol.
             side: BUY or SELL.
             shares: Proposed share count.
-            limit_price: Optional limit price.
+            limit_price: Optional limit price. When omitted, the price is
+                resolved from what is already known about the ticker; if
+                nothing is known the order is refused rather than checked
+                against a guess.
 
         Returns:
             RiskResult with passed=True if no errors (warnings may still be present).
@@ -78,6 +82,14 @@ class RiskChecker:
         ticker = ticker.upper()
         errors: list[str] = []
         warnings: list[str] = []
+
+        # 0. Resolve a price. Every check that needs one uses this and nothing
+        #    else, so a market order is checked against a known price or refused
+        #    outright. It is never checked against an invented one.
+        resolution = resolve_price(self._db, ticker, limit_price)
+        if not resolution.ok:
+            errors.append(resolution.reason)
+        price = resolution.price
 
         # 1. Tradable allowlist
         if self.tradable_allowlist and ticker not in self.tradable_allowlist:
@@ -138,9 +150,9 @@ class RiskChecker:
                 "Short selling is not supported."
             )
 
-        # 7. Sufficient cash for buy (if limit price is known)
-        if side == OrderSide.BUY and limit_price:
-            order_cost = shares * limit_price
+        # 7. Sufficient cash for buy
+        if side == OrderSide.BUY and price is not None:
+            order_cost = shares * price
             cash = get_cash_balance(self._db)
             if order_cost > cash:
                 errors.append(
@@ -149,8 +161,8 @@ class RiskChecker:
                 )
 
         # 8. Concentration warning (informational only)
-        if limit_price and side == OrderSide.BUY:
-            order_value = shares * limit_price
+        if price is not None and side == OrderSide.BUY:
+            order_value = shares * price
             total_value = self._total_portfolio_value()
             if total_value > 0:
                 projected_concentration = (

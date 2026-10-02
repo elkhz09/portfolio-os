@@ -16,9 +16,10 @@ from app.db.models import AuditLog, Holding, Order, OrderSide, OrderStatus, Targ
 from app.db.session import SessionLocal
 from app.execution.paper_engine import ExecutionError, PaperEngine
 from app.parser.command_parser import CommandName, ParseError, parse_command
+from app.portfolio.pricing import resolve_price
 from app.portfolio.state import PortfolioState
 from app.reports.generator import ReportGenerator
-from app.risk.checks import RiskChecker
+from app.risk.checks import RiskChecker, RiskResult
 
 settings = get_settings()
 
@@ -180,18 +181,28 @@ async def _handle(name, args, db, reporter, engine, risk, user_id: int) -> str:
 
         case CommandName.CONFIRM:
             order_id = args["order_id"]
-            order = engine.confirm_order(order_id, user_id)
             if settings.paper_mode:
-                holding = db.query(Holding).filter_by(ticker=order.ticker).first()
-                sim_price = (holding.last_price or holding.avg_cost) if holding else 1.0
-                if sim_price == 0:
-                    sim_price = 1.0
-                trade = engine.execute_order(order_id, market_price=sim_price)
+                # Resolve the fill price before changing any state, so an order
+                # that cannot be priced is refused while still PENDING and can
+                # be cancelled or re-entered with a limit price.
+                pending = db.get(Order, order_id)
+                if pending is None:
+                    raise ExecutionError(f"Order {order_id} not found")
+                fill = resolve_price(db, pending.ticker, pending.limit_price)
+                if not fill.ok:
+                    refusal = RiskResult(passed=False, errors=[fill.reason])
+                    return (
+                        f"🚫 Order #{order_id} cannot be priced, so it was "
+                        f"not executed:\n{refusal.summary}"
+                    )
+                order = engine.confirm_order(order_id, user_id)
+                trade = engine.execute_order(order_id, market_price=fill.price)
                 return (
                     f"✅ Paper trade executed\n"
                     f"#{order_id} {order.side.value} {order.shares} "
                     f"{order.ticker} @ ${trade.price:,.2f}"
                 )
+            engine.confirm_order(order_id, user_id)
             return f"✅ Order #{order_id} confirmed. Awaiting execution."
 
         case CommandName.CANCEL:
