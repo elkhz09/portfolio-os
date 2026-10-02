@@ -11,8 +11,8 @@ It never picks an investment or reallocates on its own. There is no signal and n
 model. What is automated is the accounting around a decision, which is the part I
 kept getting wrong in a spreadsheet.
 
-Python 3.11+, SQLAlchemy, Pydantic, python-telegram-bot, Streamlit. 2,700 lines
-of application code, 1,500 of tests.
+Python 3.11+, SQLAlchemy, Pydantic, python-telegram-bot, Streamlit. 2,300 lines
+of application code, 1,650 of tests.
 
 ---
 
@@ -33,7 +33,12 @@ Orders go in as text and come back as state you can query.
   guessing what you meant. `/buy AAPL` with no size is an error, not a default.
 - **Pre-trade risk checks.** Tradable allowlist, duplicate open order, open order
   count, position size, no short selling, cash sufficiency, concentration
-  warning. A failing check stops the order being created at all.
+  warning. A failing check stops the order being created at all, and the same
+  checks run again at `/confirm` against the position as it is then.
+- **One price resolver, and it is allowed to refuse.** The policy is *fetch, or
+  use what is known, or refuse — never invent*: an explicit limit price, else
+  the last marked price, else the average cost actually paid, else the order is
+  declined. Nothing fills at a placeholder.
 - **Append-only cash ledger.** Every movement is a row that stores the balance
   after it. The current balance is read from the last row rather than recomputed,
   so there is one number and a history of how it got there.
@@ -48,22 +53,25 @@ Orders go in as text and come back as state you can query.
 
 ### What the tests actually protect
 
-181 tests, all passing, most recently on Python 3.14.
+158 tests, all passing, most recently on Python 3.14. Every one of them covers
+code that runs. That number used to be 181; 67 of those defended a module that
+was never on the execution path, and deleting it was worth more than the count.
 
 | Area | Tests | What breaks without them |
 |---|---|---|
-| Pydantic instruction schema | 67 | see the note below, this module is not on the live path |
 | Models, ledger, reports | 33 | balance arithmetic, report rendering |
-| Live command parser | 18 | malformed orders being accepted |
+| Risk checks | 25 | selling more than held, duplicate orders, cash limits, unpriced orders |
+| Command parser | 22 | malformed orders being accepted |
 | Execution | 18 | weighted average cost, cash direction, state guards |
-| Risk checks | 17 | selling more than held, duplicate orders, cash limits |
+| `/confirm` pricing and re-checks | 18 | filling at a guessed price, confirming against stale cash |
+| Price resolution | 14 | a fabricated price reaching the ledger |
 | Settings parsing | 10 | startup aborting on a comma-separated env var |
 | Rebalance | 9 | drift sizing, sell-before-buy ordering, unpriced tickers |
 | FIFO | 9 | lot ordering across partial sells |
 
 ## What was hard
 
-Three things, none of them the Telegram part.
+Four things, none of them the Telegram part.
 
 **Realised P&L across partial sells.** Selling half a position twice, from lots
 bought at different prices, has one right answer and several plausible wrong ones,
@@ -78,8 +86,19 @@ how two of them end up disagreeing, so all six call sites read it from the ledge
 through one function and nothing else touches the balance.
 
 **Deciding when a check runs.** Checks at order entry are cheap and catch typos.
-Checks at execution are the ones that are actually true. The code does the
-former, which is a real limitation rather than a resolved question. See below.
+Checks at confirm are the ones that are actually true, because the cash and the
+position can both move in between. The code now does both. The thing that made
+that awkward is that at confirm the order is already on the book, so it reads as
+its own duplicate and counts against its own open-order limit — `check_order`
+takes an `exclude_order_id` for exactly that, and two tests exist only to pin
+that excluding it does not quietly disable the checks it is excluded from.
+
+**Having one answer to "what does this fill at".** There is no price feed, so
+the price has to come from a limit price or from something already recorded. The
+risk layer and the bot each worked that out separately, and they drifted into
+disagreeing: the risk checks skipped the cash test on a market order, while the
+bot filled a never-held ticker at $1.00. Both now call one resolver that returns
+a price or a refusal, which is the only reason the two can no longer diverge.
 
 ---
 
@@ -111,6 +130,10 @@ anyone who finds the bot can use it, so set it.
 |---|---|
 | `/buy TICKER SIZE [PRICE] [--thesis ...]` | Queue a buy, with the reason attached |
 | `/sell TICKER SIZE [PRICE]` | Queue a sell |
+
+Leaving `PRICE` off means "use what you already know about this ticker". If
+nothing is known the order is refused and tells you to set a `/price` or give a
+limit — it is never filled at a guess.
 | `/confirm ID` / `/cancel ID` | Execute or drop a pending order |
 | `/price TICKER VALUE` | Set the last known price, used for marks and fills |
 | `/weight TICKER 0.XX` | Set a target allocation |
@@ -122,7 +145,9 @@ anyone who finds the bot can use it, so set it.
 ## What it does not do
 
 - No broker integration. Nothing reaches a real market.
-- No price feed. Marks are as fresh as the last `/price` you typed.
+- No price feed. Marks are as fresh as the last `/price` you typed, and an order
+  on a ticker you have never priced is declined rather than guessed at. If a feed
+  is ever added it belongs in `app/portfolio/pricing.py` and nowhere else.
 - Single user, single currency, one portfolio, no benchmark or attribution.
 - FIFO only. Not tax accounting, and no cost-basis elections.
 
@@ -131,19 +156,23 @@ anyone who finds the bot can use it, so set it.
 These are checked against the code rather than remembered, and they are the
 answers to the questions worth asking about it.
 
-**Risk checks run at order entry and are not re-run at `/confirm`.** An order
-confirmed much later is being confirmed against the cash position as it was when
-it was entered. One user and short-lived orders make that survivable. It is still
-a gap, not a design choice.
+**A refused order gives you no way to see the price it was refused for.** The
+refusal names the remedy (`/price TICKER VALUE`) but not what the system
+currently thinks the ticker is worth, because it thinks nothing. Checking means
+running `/status`.
 
-**The cash check only runs when you give a limit price.** `/buy NVDA 50 180` is
-checked against cash. `/buy NVDA 50` is not, because without a price there is
-nothing to check against, and nothing substitutes the last known price in. A
-market order of 50,000 shares passes every check on a $100,000 account.
+**The price resolver has no feed, so its first tier is you.** "Fetch, or use what
+is known, or refuse" is three tiers on paper and two in practice: there is no
+fetch. A `/price` from last week counts as known and an order is checked and
+filled against it without complaint. The holdings row has an `updated_at`, but it
+moves on any change to the row including a trade, so it is not the age of the
+price and nothing reads it as one. Refusing to guess is not the same as knowing
+the mark is current.
 
-**A market order on a ticker with no price set fills at $1.00.** The paper fill
-falls back to the last marked price, then the average cost, then to 1.0. The last
-step is a placeholder that should refuse instead. Set `/price` first.
+**Re-checking at `/confirm` is not a lock.** It closes the window between entry
+and confirm, which is where the real risk was. It does not make confirm atomic —
+there is one user and one process, so nothing else is writing, and that is the
+only reason it holds.
 
 **In paper mode `/confirm` confirms and executes in one step,** so `CONFIRMED` is
 a state the database records but a user never sees. The three-state machine is
@@ -155,13 +184,21 @@ that, only that two exist.
 
 ## What went wrong building it
 
-**Two parsers exist and only one is wired in.** `app/parser/instructions.py` is a
-Pydantic schema set, 449 lines, with more tests behind it than any other file here.
-The bot imports `app/parser/command_parser.py`, which is regex and `shlex`.
-Nothing on the runtime path imports the Pydantic layer. So 67 of the 181 tests
-cover a module that never runs, and the headline test count is better than the
-coverage it implies. Either wiring it in or deleting it would be an improvement.
-Neither has happened.
+**Two parsers existed and only one was wired in.** `app/parser/instructions.py`
+was a 449-line Pydantic schema set with more tests behind it than any other file
+here — 67 of what was then 181. The bot imports `app/parser/command_parser.py`,
+which is regex and `shlex`. Nothing constructed an `Instruction`, so the headline
+test count was better than the coverage it implied. It is deleted. The test count
+went 181 to 151, which reads worse and is worth more; the re-checking work above
+took it to 158.
+
+Worth recording from the deletion: the dead module was not inert. The package
+`__init__` re-exported it, so it was imported and its Pydantic models built on
+every bot startup, for nothing. And mutating the live parser while reviewing the
+deletion turned up a gap the 67 deleted tests never covered either — zero size
+and zero limit price had no test on the parser that actually runs. Three were
+added, plus one pinning the package surface so the dead layer cannot return
+unnoticed.
 
 **Startup broke on a comma-separated environment variable.** `TRADABLE_ALLOWLIST=AAPL,SPY`
 aborted the process. `pydantic-settings` JSON-decodes list and set fields in the
@@ -178,8 +215,8 @@ tests that pin it. Two commits in this repository are that single bug.
 app/
   config/       settings and allowlist (pydantic-settings)
   db/           SQLAlchemy models, cash ledger, seed
-  parser/       command_parser.py is live; instructions.py is not
-  portfolio/    holdings, weights, drift, rebalance
+  parser/       command_parser.py — regex and shlex, strict
+  portfolio/    holdings, weights, drift, rebalance, price resolution
   execution/    paper execution and the state machine
   risk/         pre-trade checks
   analytics/    FIFO P&L, metrics
@@ -192,6 +229,7 @@ docs/           early architecture and scope notes, kept as written
 
 A broker API and a price feed are the two things that would make this usable
 against a real account. Neither is built, and listing them as a roadmap would
-overstate how close they are.
+overstate how close they are. The feed at least has a defined place to land now:
+one function, with one caller shape, that is already allowed to say no.
 
 MIT licensed.
