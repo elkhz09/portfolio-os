@@ -64,6 +64,7 @@ class RiskChecker:
         side: OrderSide,
         shares: float,
         limit_price: float | None = None,
+        exclude_order_id: int | None = None,
     ) -> RiskResult:
         """Run all pre-trade checks for a proposed order.
 
@@ -75,6 +76,9 @@ class RiskChecker:
                 resolved from what is already known about the ticker; if
                 nothing is known the order is refused rather than checked
                 against a guess.
+            exclude_order_id: An existing order to leave out of the open-order
+                checks. Set this when re-checking an order that is already on
+                the book, so it is not counted as its own duplicate.
 
         Returns:
             RiskResult with passed=True if no errors (warnings may still be present).
@@ -103,15 +107,14 @@ class RiskChecker:
             errors.append(f"Share count must be positive, got {shares}")
 
         # 3. Duplicate open order for same ticker + side
-        duplicate = (
-            self._db.query(Order)
-            .filter(
-                Order.ticker == ticker,
-                Order.side == side,
-                Order.status.in_([OrderStatus.PENDING, OrderStatus.CONFIRMED]),
-            )
-            .first()
+        dup_query = self._db.query(Order).filter(
+            Order.ticker == ticker,
+            Order.side == side,
+            Order.status.in_([OrderStatus.PENDING, OrderStatus.CONFIRMED]),
         )
+        if exclude_order_id is not None:
+            dup_query = dup_query.filter(Order.id != exclude_order_id)
+        duplicate = dup_query.first()
         if duplicate is not None:
             errors.append(
                 f"Duplicate open {side.value} order for {ticker} already exists "
@@ -120,11 +123,12 @@ class RiskChecker:
             )
 
         # 4. Open orders limit
-        open_count = (
-            self._db.query(Order)
-            .filter(Order.status.in_([OrderStatus.PENDING, OrderStatus.CONFIRMED]))
-            .count()
+        open_query = self._db.query(Order).filter(
+            Order.status.in_([OrderStatus.PENDING, OrderStatus.CONFIRMED])
         )
+        if exclude_order_id is not None:
+            open_query = open_query.filter(Order.id != exclude_order_id)
+        open_count = open_query.count()
         if open_count >= self.max_open_orders:
             errors.append(
                 f"Too many open orders ({open_count}/{self.max_open_orders}). "

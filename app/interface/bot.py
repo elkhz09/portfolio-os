@@ -181,20 +181,39 @@ async def _handle(name, args, db, reporter, engine, risk, user_id: int) -> str:
 
         case CommandName.CONFIRM:
             order_id = args["order_id"]
+            pending = db.get(Order, order_id)
+            if pending is None:
+                raise ExecutionError(f"Order {order_id} not found")
+
+            # Resolve the fill price before changing any state, so an order
+            # that cannot be priced is refused while still PENDING and can
+            # be cancelled or re-entered with a limit price.
+            fill = resolve_price(db, pending.ticker, pending.limit_price)
+            if not fill.ok:
+                refusal = RiskResult(passed=False, errors=[fill.reason])
+                return (
+                    f"🚫 Order #{order_id} cannot be priced, so it was "
+                    f"not executed:\n{refusal.summary}"
+                )
+
+            # Re-run risk at confirm. The checks at entry were true then; the
+            # cash and the position may both have moved since. The order is
+            # excluded from the open-order checks so it is not its own rival.
+            recheck = risk.check_order(
+                pending.ticker,
+                pending.side,
+                pending.shares,
+                pending.limit_price,
+                exclude_order_id=pending.id,
+            )
+            if not recheck.passed:
+                return (
+                    f"🚫 Order #{order_id} no longer passes its risk checks, "
+                    f"so it was not executed:\n{recheck.summary}\n\n"
+                    f"It is still PENDING — /cancel {order_id} to drop it."
+                )
+
             if settings.paper_mode:
-                # Resolve the fill price before changing any state, so an order
-                # that cannot be priced is refused while still PENDING and can
-                # be cancelled or re-entered with a limit price.
-                pending = db.get(Order, order_id)
-                if pending is None:
-                    raise ExecutionError(f"Order {order_id} not found")
-                fill = resolve_price(db, pending.ticker, pending.limit_price)
-                if not fill.ok:
-                    refusal = RiskResult(passed=False, errors=[fill.reason])
-                    return (
-                        f"🚫 Order #{order_id} cannot be priced, so it was "
-                        f"not executed:\n{refusal.summary}"
-                    )
                 order = engine.confirm_order(order_id, user_id)
                 trade = engine.execute_order(order_id, market_price=fill.price)
                 return (

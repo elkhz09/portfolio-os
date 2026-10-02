@@ -153,3 +153,125 @@ class TestConfirmStillExecutesPriceableOrders:
     def test_missing_order_still_reports_not_found(self, db):
         with pytest.raises(Exception, match="not found"):
             confirm(db, 999)
+
+
+class TestConfirmRerunsRiskChecks:
+    """Risk is re-checked at /confirm, not only at order entry.
+
+    An order entered when the cash was there, confirmed after the cash has
+    gone, used to execute against a stale check.
+    """
+
+    def test_order_refused_when_cash_has_since_gone(self, db):
+        append_cash_entry(db, CashEntryType.DEPOSIT, 100_000.0)
+        db.commit()
+        order = queue(db, "NVDA", 500.0, limit_price=180.0)  # 90,000, affordable
+        assert RiskChecker(db).check_order(
+            "NVDA", OrderSide.BUY, 500.0, limit_price=180.0,
+            exclude_order_id=order.id,
+        ).passed
+
+        append_cash_entry(db, CashEntryType.WITHDRAWAL, -60_000.0)
+        db.commit()
+
+        reply = confirm(db, order.id)
+        assert "🚫" in reply
+        assert "cash" in reply.lower()
+        assert db.query(Trade).count() == 0
+
+    def test_order_stays_pending_after_a_failed_recheck(self, db):
+        append_cash_entry(db, CashEntryType.DEPOSIT, 100_000.0)
+        db.commit()
+        order = queue(db, "NVDA", 500.0, limit_price=180.0)
+        append_cash_entry(db, CashEntryType.WITHDRAWAL, -60_000.0)
+        db.commit()
+        confirm(db, order.id)
+        db.refresh(order)
+        assert order.status == OrderStatus.PENDING
+
+    def test_cash_untouched_after_a_failed_recheck(self, db):
+        append_cash_entry(db, CashEntryType.DEPOSIT, 100_000.0)
+        db.commit()
+        order = queue(db, "NVDA", 500.0, limit_price=180.0)
+        append_cash_entry(db, CashEntryType.WITHDRAWAL, -60_000.0)
+        db.commit()
+        before = get_cash_balance(db)
+        confirm(db, order.id)
+        assert get_cash_balance(db) == before
+
+    def test_order_does_not_block_itself_as_a_duplicate(self, db):
+        """The trap in re-checking at confirm: the order is its own rival."""
+        append_cash_entry(db, CashEntryType.DEPOSIT, 100_000.0)
+        db.commit()
+        order = queue(db, "NVDA", 10.0, limit_price=180.0)
+        reply = confirm(db, order.id)
+        db.refresh(order)
+        assert order.status == OrderStatus.EXECUTED
+        assert "Duplicate" not in reply
+
+    def test_order_does_not_trip_the_open_order_limit_on_itself(self, db):
+        append_cash_entry(db, CashEntryType.DEPOSIT, 100_000.0)
+        db.commit()
+        order = queue(db, "NVDA", 10.0, limit_price=180.0)
+        state = PortfolioState(db)
+        reply = asyncio.run(
+            _handle(
+                CommandName.CONFIRM,
+                {"order_id": order.id},
+                db,
+                ReportGenerator(db),
+                PaperEngine(db, state),
+                RiskChecker(db, max_open_orders=1),  # this order is the only one
+                USER,
+            )
+        )
+        db.refresh(order)
+        assert order.status == OrderStatus.EXECUTED
+        assert "Too many open orders" not in reply
+
+    def test_a_genuine_second_open_order_still_blocks(self, db):
+        """Excluding the order from its own checks must not disable them."""
+        append_cash_entry(db, CashEntryType.DEPOSIT, 100_000.0)
+        db.commit()
+        order = queue(db, "NVDA", 10.0, limit_price=180.0)
+        other = Order(
+            ticker="SPY", side=OrderSide.BUY, shares=1.0, limit_price=10.0,
+            status=OrderStatus.PENDING, paper=True, telegram_user_id=USER,
+        )
+        db.add(other)
+        db.commit()
+        state = PortfolioState(db)
+        reply = asyncio.run(
+            _handle(
+                CommandName.CONFIRM,
+                {"order_id": order.id},
+                db,
+                ReportGenerator(db),
+                PaperEngine(db, state),
+                RiskChecker(db, max_open_orders=1),
+                USER,
+            )
+        )
+        db.refresh(order)
+        assert order.status == OrderStatus.PENDING
+        assert "Too many open orders" in reply
+
+    def test_sell_refused_at_confirm_when_position_was_sold_meanwhile(self, db):
+        db.add(Holding(ticker="GLD", shares=100.0, avg_cost=50.0, last_price=50.0))
+        db.commit()
+        order = Order(
+            ticker="GLD", side=OrderSide.SELL, shares=80.0,
+            status=OrderStatus.PENDING, paper=True, telegram_user_id=USER,
+        )
+        db.add(order)
+        db.commit()
+        db.refresh(order)
+
+        holding = db.query(Holding).filter_by(ticker="GLD").first()
+        holding.shares = 10.0  # sold elsewhere
+        db.commit()
+
+        reply = confirm(db, order.id)
+        db.refresh(order)
+        assert order.status == OrderStatus.PENDING
+        assert "Short selling" in reply
